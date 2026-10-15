@@ -1,0 +1,72 @@
+{
+  "kaspad_commit": "f6876d5407f61809410312aade5294c57233667b",
+  "wallet_version": "igra-official-kaspawallet version 0.12.23",
+  "cast_version": "cast Version: 1.6.0-dev\nCommit SHA: ade9374d007ebc35a9380c45542a9a99800bd712\nBuild Timestamp: 2026-10-15T11:02:25.412434000Z (1792062145)\nBuild Profile: debug",
+  "go_sign_command_succeeded": true,
+  "go_returned_pst_accepted": false,
+  "go_preserved_lane": true,
+  "go_preserved_tx_id": true,
+  "prepared_compute_budgets": [
+    20,
+    20
+  ],
+  "go_returned_compute_budgets": [
+    3,
+    3
+  ],
+  "go_verification_error": "Error: input 0 has an invalid partial signature\n\nContext:\n- signature failed verification",
+  "independent_cast_signers": 3,
+  "merged_quorums": {
+    "12": {
+      "ok": true,
+      "kaspa_tx_id": "97b1ca48f2882c6c496e7359a65376650285ce5071193cd072fc6ea0f0f8dd2e",
+      "payload_nonce": 123699,
+      "inputs": 2,
+      "outputs": 3,
+      "signed_inputs": 2,
+      "fully_signed": true
+    },
+    "13": {
+      "ok": true,
+      "kaspa_tx_id": "97b1ca48f2882c6c496e7359a65376650285ce5071193cd072fc6ea0f0f8dd2e",
+      "payload_nonce": 123699,
+      "inputs": 2,
+      "outputs": 3,
+      "signed_inputs": 2,
+      "fully_signed": true
+    },
+    "23": {
+      "ok": true,
+      "kaspa_tx_id": "97b1ca48f2882c6c496e7359a65376650285ce5071193cd072fc6ea0f0f8dd2e",
+      "payload_nonce": 123699,
+      "inputs": 2,
+      "outputs": 3,
+      "signed_inputs": 2,
+      "fully_signed": true
+    },
+    "123": {
+      "ok": true,
+      "kaspa_tx_id": "97b1ca48f2882c6c496e7359a65376650285ce5071193cd072fc6ea0f0f8dd2e",
+      "payload_nonce": 123699,
+      "inputs": 2,
+      "outputs": 3,
+      "signed_inputs": 2,
+      "fully_signed": true
+    },
+    "duplicate": {
+      "ok": true,
+      "kaspa_tx_id": "97b1ca48f2882c6c496e7359a65376650285ce5071193cd072fc6ea0f0f8dd2e",
+      "payload_nonce": 123699,
+      "inputs": 2,
+      "outputs": 3,
+      "signed_inputs": 2,
+      "fully_signed": true
+    }
+  },
+  "kaspa_tx_id": "97b1ca48f2882c6c496e7359a65376650285ce5071193cd072fc6ea0f0f8dd2e",
+  "broadcast": false,
+  "fixture": "Disposable keys; nonexistent input; local script validation only",
+  "igra_base_commit": "ade9374d007ebc35a9380c45542a9a99800bd712",
+  "rusty_kaspa_consensus_commit": "895766fd6e882e5ebf1ede74f9de610d616afa14",
+  "exit_unit_tests_passed": 18
+}

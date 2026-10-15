@@ -18,7 +18,7 @@ use kaspa_consensus_core::{
     },
     hashing::{
         sighash::{
-            SigHashReusedValuesUnsync as KaspaSigHashReusedValuesUnsync,
+            SigHashReusedValuesUnsync as KaspaSigHashReusedValuesUnsync, calc_ecdsa_signature_hash,
             calc_schnorr_signature_hash,
         },
         sighash_type::SIG_HASH_ALL as KASPA_SIG_HASH_ALL,
@@ -724,6 +724,7 @@ pub fn verify_unsigned_exit(
         options.allow_non_igra_lock_script_for_testing,
     )?;
     verify_outputs(&tx, manifest)?;
+    verify_exit_partial_signatures(&tx, &pst, manifest)?;
 
     let signed_inputs = pst
         .partially_signed_inputs
@@ -770,6 +771,129 @@ pub fn verify_unsigned_exit(
         signed_inputs,
         fully_signed,
     })
+}
+
+// Validate every imported signature, including when quorum has not yet been reached.
+// Counting nonempty slots is not sufficient for accepting an offline wallet response.
+fn verify_exit_partial_signatures(
+    tx: &KaspaTransaction,
+    pst: &PartiallySignedTransactionProto,
+    manifest: &UnsignedExitManifest,
+) -> Result<()> {
+    let populated = KaspaPopulatedTransaction::new(
+        tx,
+        input_utxo_entries(&build_input_from_manifest(manifest))?,
+    );
+    let reused = KaspaSigHashReusedValuesUnsync::new();
+    for (index, input) in pst.partially_signed_inputs.iter().enumerate() {
+        for pair in &input.pub_key_signature_pairs {
+            if pair.signature.is_empty() {
+                continue;
+            }
+            if pair.signature.len() != KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE
+                || pair.signature[64] != KASPA_SIG_HASH_ALL.to_u8()
+            {
+                bail!("input {index} has an invalid signature encoding or sighash type");
+            }
+            let key = pair
+                .extended_pub_key
+                .parse::<KaspaExtendedPublicKey<KaspaSecpPublicKey>>()?;
+            let result = if manifest.multisig.ecdsa {
+                let digest =
+                    calc_ecdsa_signature_hash(&populated, index, KASPA_SIG_HASH_ALL, &reused);
+                let message = KaspaSecpMessage::from_digest_slice(digest.as_bytes().as_slice())?;
+                let signature =
+                    kaspa_bip32::secp256k1::ecdsa::Signature::from_compact(&pair.signature[..64])?;
+                KASPA_SECP256K1.verify_ecdsa(&message, &signature, key.public_key())
+            } else {
+                let digest =
+                    calc_schnorr_signature_hash(&populated, index, KASPA_SIG_HASH_ALL, &reused);
+                let message = KaspaSecpMessage::from_digest_slice(digest.as_bytes().as_slice())?;
+                let signature =
+                    kaspa_bip32::secp256k1::schnorr::Signature::from_slice(&pair.signature[..64])?;
+                KASPA_SECP256K1.verify_schnorr(
+                    &signature,
+                    &message,
+                    &key.public_key().x_only_public_key().0,
+                )
+            };
+            result.wrap_err_with(|| format!("input {index} has an invalid partial signature"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Combine independent offline signatures without modifying the prepared transaction.
+pub fn merge_exit_wallet_transactions(
+    manifest: &UnsignedExitManifest,
+    wallet_hexes: &[String],
+    allow_non_igra_lock_script_for_testing: bool,
+) -> Result<String> {
+    if wallet_hexes.is_empty() {
+        bail!("at least one wallet transaction is required");
+    }
+    let mut merged: Option<PartiallySignedTransactionProto> = None;
+    for wallet_hex in wallet_hexes {
+        verify_unsigned_exit(
+            manifest,
+            wallet_hex,
+            VerifyExitOptions {
+                allow_signatures: true,
+                require_fully_signed: false,
+                allow_non_igra_lock_script_for_testing,
+            },
+        )?;
+        let incoming =
+            PartiallySignedTransactionProto::decode(decode_wallet_hex(wallet_hex)?.as_slice())?;
+        if let Some(target) = &mut merged {
+            if target.tx != incoming.tx {
+                bail!("offline responses contain different transaction bodies");
+            }
+            for (input, other) in target
+                .partially_signed_inputs
+                .iter_mut()
+                .zip(incoming.partially_signed_inputs)
+            {
+                let mut unsigned_input = input.clone();
+                let mut unsigned_other = other.clone();
+                for pair in &mut unsigned_input.pub_key_signature_pairs {
+                    pair.signature.clear();
+                }
+                for pair in &mut unsigned_other.pub_key_signature_pairs {
+                    pair.signature.clear();
+                }
+                if unsigned_input != unsigned_other {
+                    bail!("offline responses contain different signing metadata");
+                }
+                for (pair, other_pair) in input
+                    .pub_key_signature_pairs
+                    .iter_mut()
+                    .zip(other.pub_key_signature_pairs)
+                {
+                    if other_pair.signature.is_empty() {
+                        continue;
+                    }
+                    if !pair.signature.is_empty() && pair.signature != other_pair.signature {
+                        bail!("conflicting signatures for the same input and public key");
+                    }
+                    pair.signature = other_pair.signature;
+                }
+            }
+        } else {
+            merged = Some(incoming);
+        }
+    }
+    let result = hex::encode(merged.expect("nonempty input checked").encode_to_vec());
+    verify_unsigned_exit(
+        manifest,
+        &result,
+        VerifyExitOptions {
+            allow_signatures: true,
+            require_fully_signed: false,
+            allow_non_igra_lock_script_for_testing,
+        },
+    )?;
+    Ok(result)
 }
 
 pub fn decode_wallet_transaction(wallet_hex: &str) -> Result<KaspaTransaction> {
@@ -996,7 +1120,10 @@ pub fn materialize_signed_wallet_transaction(
 
         let mut script_builder = ScriptBuilder::new();
         if manifest.multisig.extended_public_keys.len() > 1 {
-            for signature in signatures {
+            for signature in signatures
+                .into_iter()
+                .take(partial_input.minimum_signatures as usize)
+            {
                 script_builder.add_data(signature)?;
             }
             let redeem_script = multisig_redeem_script_for_path(
@@ -3028,7 +3155,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_allows_signed_wallet_hex_without_requiring_original_hex_hash() {
+    fn verify_rejects_invalid_partial_signature_before_quorum() {
         let output = build_unsigned_exit(
             sample_input(),
             BuildExitOptions {
@@ -3063,7 +3190,7 @@ mod tests {
             .is_err()
         );
 
-        let report = verify_unsigned_exit(
+        let error = verify_unsigned_exit(
             &output.manifest,
             &signed_hex,
             VerifyExitOptions {
@@ -3072,9 +3199,8 @@ mod tests {
                 allow_non_igra_lock_script_for_testing: false,
             },
         )
-        .expect("verify signed exit");
-        assert_eq!(report.signed_inputs, 1);
-        assert!(!report.fully_signed);
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid signature encoding"));
     }
 
     #[test]
@@ -3429,7 +3555,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("signed Kaspa transaction scripts failed validation"));
+        assert!(err.to_string().contains("invalid partial signature"));
     }
 
     #[test]
@@ -3505,6 +3631,83 @@ mod tests {
             },
         )
         .expect("sign second key");
+
+        let independent_2 = sign_exit_wallet_transaction(
+            &output.manifest,
+            &output.wallet_hex,
+            SignExitOptions {
+                master_private_keys: vec![
+                    "kprv61JFuZekJ8eXzTHWXWmgK1DBYS831w4Ej3gHMnPZJ1G7hB9GS4wjW8AxEYMEMBrgCdnyt54pxmNXC5KgNegPhHLaYDVhXid5WHnNxE7Nir6".to_string(),
+                ],
+                allow_non_igra_lock_script_for_testing: true,
+                ..SignExitOptions::default()
+            },
+        ).expect("sign independently");
+        let merged = merge_exit_wallet_transactions(
+            &output.manifest,
+            &[
+                signed_1.wallet_hex.clone(),
+                independent_2.wallet_hex.clone(),
+                signed_1.wallet_hex.clone(),
+            ],
+            true,
+        )
+        .expect("merge independent and duplicate responses");
+        let merged_report = verify_unsigned_exit(
+            &output.manifest,
+            &merged,
+            VerifyExitOptions {
+                allow_signatures: true,
+                require_fully_signed: true,
+                allow_non_igra_lock_script_for_testing: true,
+            },
+        )
+        .expect("merged quorum executes scripts");
+        assert_eq!(
+            merged_report.kaspa_tx_id,
+            output.manifest.protocol.kaspa_tx_id
+        );
+        let reversed = merge_exit_wallet_transactions(
+            &output.manifest,
+            &[independent_2.wallet_hex, signed_1.wallet_hex.clone()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(merged, reversed);
+
+        let mut corrupt = PartiallySignedTransactionProto::decode(
+            decode_wallet_hex(&signed_1.wallet_hex).unwrap().as_slice(),
+        )
+        .unwrap();
+        let signature = &mut corrupt.partially_signed_inputs[0]
+            .pub_key_signature_pairs
+            .iter_mut()
+            .find(|pair| !pair.signature.is_empty())
+            .unwrap()
+            .signature;
+        signature[10] ^= 1;
+        let error = merge_exit_wallet_transactions(
+            &output.manifest,
+            &[hex::encode(corrupt.encode_to_vec())],
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("invalid partial signature"));
+
+        let mut changed = PartiallySignedTransactionProto::decode(
+            decode_wallet_hex(&signed_1.wallet_hex).unwrap().as_slice(),
+        )
+        .unwrap();
+        changed.tx.as_mut().unwrap().outputs[0].value += 1;
+        assert!(
+            merge_exit_wallet_transactions(
+                &output.manifest,
+                &[hex::encode(changed.encode_to_vec())],
+                true
+            )
+            .is_err()
+        );
+        assert!(merge_exit_wallet_transactions(&output.manifest, &[], true).is_err());
 
         assert_eq!(signed_2.signed_pairs_added, 1);
         assert!(signed_2.fully_signed);

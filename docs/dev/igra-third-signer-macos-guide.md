@@ -1,6 +1,11 @@
 # IGRA Third Signer Guide (macOS)
 
-Last updated: 2026-04-27, Asia/Jerusalem
+Historical guide: 2026-04-27, Asia/Jerusalem.
+
+**Superseded for Toccata v1 lane exits.** The official Go wallet can report signing
+success while producing an invalid v1 signature. Use the [current exit runbook](igra-exit-unsigned-tx-runbook.md#sign-with-cast-v1-signer)
+and `cast igra sign-exit` with the same encrypted wallet file. The historical
+`kaspawallet sign` instructions below must not be used for current v1 lane exits.
 
 This guide is for the non-technical signer.
 

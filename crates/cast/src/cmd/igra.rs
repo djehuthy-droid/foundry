@@ -10,7 +10,8 @@ use foundry_common::igra_exit::{
     BuildExitInput, BuildExitOptions, MultisigAddressInput, SignExitOptions, VerifyExitOptions,
     broadcast_wallet_transaction, build_unsigned_exit, check_multisig_derivation_path,
     decode_wallet_transaction, derive_multisig_address, inspect_exit_wallet_transaction,
-    sign_exit_wallet_transaction, verify_multisig_address, verify_unsigned_exit,
+    merge_exit_wallet_transactions, sign_exit_wallet_transaction, verify_multisig_address,
+    verify_unsigned_exit,
 };
 use serde::Deserialize;
 use std::{fs, path::PathBuf, time::Duration};
@@ -32,6 +33,9 @@ pub enum IgraSubcommand {
     /// Sign an IGRA exit PST with a kaspawallet keys.json, mnemonic, or multisig master kprv.
     #[command(name = "sign-exit")]
     SignExit(SignExitArgs),
+    /// Merge independently signed exit PSTs after verifying every signature.
+    #[command(name = "merge-exit")]
+    MergeExit(MergeExitArgs),
     /// Decode an IGRA exit PST hex file for offline human inspection.
     #[command(name = "inspect-exit")]
     InspectExit(InspectExitArgs),
@@ -128,6 +132,44 @@ pub struct VerifyExitArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct MergeExitArgs {
+    #[arg(long = "manifest", value_hint = clap::ValueHint::FilePath)]
+    pub manifest_json: PathBuf,
+    /// Repeat for each independently signed response to the same prepared transaction.
+    #[arg(long, required = true, value_hint = clap::ValueHint::FilePath)]
+    pub hex: Vec<PathBuf>,
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub out_hex: PathBuf,
+    #[arg(long)]
+    pub allow_non_igra_lock_script_for_testing: bool,
+}
+
+impl MergeExitArgs {
+    fn run(self) -> Result<()> {
+        let manifest = serde_json::from_str(&fs::read_to_string(&self.manifest_json)?)?;
+        let inputs = self
+            .hex
+            .iter()
+            .map(fs::read_to_string)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let merged = merge_exit_wallet_transactions(
+            &manifest,
+            &inputs,
+            self.allow_non_igra_lock_script_for_testing,
+        )?;
+        // Never truncate an existing unsigned artifact or signer response.
+        use std::io::Write;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.out_hex)?;
+        writeln!(output, "{merged}")?;
+        foundry_common::sh_println!("merged wallet hex: {}", self.out_hex.display())?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Args)]
 pub struct SignExitArgs {
     /// JSON manifest produced by `cast igra build-exit`.
     #[arg(long = "manifest", value_hint = clap::ValueHint::FilePath)]
@@ -168,6 +210,10 @@ pub struct SignExitArgs {
     /// Drop existing PST signatures before signing. Use to recover from signatures made by the wrong signer.
     #[arg(long)]
     pub clear_existing_signatures: bool,
+
+    /// Permit non-official lock scripts for disposable signing rehearsals only.
+    #[arg(long)]
+    pub allow_non_igra_lock_script_for_testing: bool,
 
     /// Overwrite existing output file.
     #[arg(long)]
@@ -282,6 +328,7 @@ impl IgraArgs {
             IgraSubcommand::BuildExit(args) => args.run(),
             IgraSubcommand::VerifyExit(args) => args.run().await,
             IgraSubcommand::SignExit(args) => args.run(),
+            IgraSubcommand::MergeExit(args) => args.run(),
             IgraSubcommand::InspectExit(args) => args.run(),
             IgraSubcommand::DeriveMsigAddress(args) => args.run(),
             IgraSubcommand::VerifyMsigAddress(args) => args.run(),
@@ -443,7 +490,7 @@ impl SignExitArgs {
                 go_kaspawallet_mnemonics,
                 master_private_keys,
                 clear_existing_signatures: self.clear_existing_signatures,
-                allow_non_igra_lock_script_for_testing: false,
+                allow_non_igra_lock_script_for_testing: self.allow_non_igra_lock_script_for_testing,
             },
         )?;
 

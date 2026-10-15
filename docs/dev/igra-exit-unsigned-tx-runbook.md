@@ -412,6 +412,75 @@ Each signer should inspect:
 - `tx_id_prefix`
 - multisig xpubs and `minimum_signatures`
 
+## Independent Offline Signatures (Igeret Fork)
+
+The fork keeps Igra's `build-exit`, `inspect-exit`, `verify-exit`, `sign-exit`, and
+verified broadcast arguments and the `igra.exit.unsigned.v2` manifest / hex protobuf PST formats.
+A PST includes previous-output amounts/scripts, derivation paths, and signer public keys;
+it is not just a bare Kaspa transaction or the Rust wallet's PSKT JSON.
+
+Every signer can receive the same unsigned manifest and PST, sign independently with
+`cast igra sign-exit`, and return their own PST. The online coordinator combines responses:
+
+```bash
+cast igra merge-exit --manifest unsigned-exit.json \
+  --hex signer1.hex --hex signer2.hex --out-hex quorum.hex
+cast igra verify-exit --manifest unsigned-exit.json --hex quorum.hex \
+  --allow-signatures --require-fully-signed
+```
+
+`merge-exit` verifies every supplied signature, requires identical transaction bodies and
+signing metadata, deduplicates identical responses, and refuses conflicting signatures.
+It does not overwrite existing output files. With three responses to a 2-of-3 transaction,
+materialization selects two signatures in the existing public-key order. It never changes
+recipients, amounts, change, lane, payload nonce, or the prepared transaction ID.
+`verify-exit --allow-signatures` now cryptographically checks partial signatures before quorum.
+
+The coordinator must authenticate the manifest against Igeret's verified withdrawal evidence,
+route, custody membership, and local release policy. `verify-exit` proves transaction/manifest
+consistency and signature validity; it does **not** prove Igra attestation eligibility, Kaspa
+finality, live UTXO availability, or absence of earlier payouts. Those checks and persistent
+batch/UTXO reservations remain the responsibility of Igeret. Do not accept an arbitrary
+operator-provided manifest as withdrawal authorization. Importing PST signatures into Igeret's
+existing Rust PSKT/CRDT pipeline still requires an explicit adapter; this Foundry extension
+alone does not implement that import or the complete daily evidence-export workflow.
+
+### Official Go wallet compatibility
+
+The official `kaspanet/kaspad` release `v0.12.23` at
+`f6876d5407f61809410312aade5294c57233667b` has a different signing digest for these
+v1 lane exits. Its CLI can print signing success even though the returned signature fails
+current Kaspa validation. It also rewrites legacy `SigOpCount` and does not retain the
+new `computeBudget` protobuf field. Preserving the lane and payload alone is insufficient.
+Use Igra's existing `cast igra sign-exit` with the same encrypted Go wallet `keys.json` for
+this transaction shape. We do not downgrade transactions or modify the official wallet.
+
+Reproduce the boundary with fresh disposable 2-of-3 wallets and a nonexistent UTXO:
+
+```bash
+go build -C /path/to/official-kaspad -o /tmp/kaspawallet ./cmd/kaspawallet
+python3 scripts/igra/official-wallet-interop.py \
+  --cast /path/to/cast --wallet /tmp/kaspawallet \
+  --kaspad-source /path/to/official-kaspad \
+  --work-dir /tmp/new-wallet-interop-run
+```
+
+The script exercises the actual official `kaspawallet sign --transaction-file` command,
+expects its v1 result to be rejected, then tests three independent Cast signers with the
+same encrypted wallet files, each 2-of-3 combination, all three responses, and duplicates.
+It never broadcasts. Keep generated wallets outside the repository. The recorded
+[result](igra-offline-wallet-interop.json) covers two inputs, two withdrawals, and custody
+change, with all three 2-of-3 combinations passing local script validation.
+
+### Deferred upstream maintenance
+
+This fork starts from Igra's `igra-canonical-exit-toccata` at
+`ade9374d007ebc35a9380c45542a9a99800bd712`. Merge the official `foundry-rs/foundry`
+upstream in a separate maintenance change, preserving Igra's API and pinned consensus
+semantics. Before promoting that merge, rebuild Cast and rerun native exit tests, the
+Go-wallet compatibility probe, and all independent-signature combinations. Record both
+upstream and Igra commit IDs; do not silently replace the Igra branch with upstream master.
+
 ## Sign With Cast V1 Signer
 
 Do not use Go `kaspawallet sign` for lane v1 exit transactions. It is valid for
@@ -528,9 +597,8 @@ Confirm recipient, amount, fee, mass, and fee rate.
 ## Broadcast
 
 For lane/subnetwork v1 exit transactions, do not broadcast the signed PST directly
-with older `kaspawallet broadcast`. Older wallet builds sign the PST correctly, but
-their broadcast path can materialize v1 inputs with legacy `sigOpCount` instead of
-`computeBudget`.
+with older `kaspawallet broadcast`. Older wallet builds can produce invalid v1 signatures; their broadcast path can
+also materialize v1 inputs with legacy `sigOpCount` instead of `computeBudget`.
 
 Only broadcast after the final artifact passes:
 
@@ -628,8 +696,8 @@ m/<wallet cosignerIndex>/0/<next external index>
 
 Alignment conclusion:
 
-- The builder is aligned with official signing if the provided `derivation_path` is the official
-  path for the UTXO.
+- The builder aligns with the official wallet key derivation and PST container if the supplied
+  path is correct. This does not imply compatibility with the Go wallet v1 signing digest.
 - The builder correctly writes per-input derived xpubs, not master xpubs.
 - The builder correctly canonicalizes multisig xpub order before deriving per-input xpubs.
 - A path like `m/0/0/0` is valid as a kaspawallet derivation path, but it is not the normal first
@@ -642,7 +710,7 @@ Alignment conclusion:
   script and signer set.
 - The CLI does not discover the derivation path from chain data. Operators must supply the correct
   path.
-- The CLI does not broadcast. Broadcasting is intentionally left to the official `kaspawallet`
-  workflow after final verification.
+- Broadcasting is available through `verify-exit --broadcast` after full verification.
+  The offline compatibility rehearsal does not exercise live UTXO acceptance or broadcast.
 - Interoperability has been tested with temporary official kaspawallet 2-of-3 key files and fake
   UTXO data. The test proves signer format compatibility, not that a fake UTXO can be broadcast.
