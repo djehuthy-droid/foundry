@@ -15,7 +15,9 @@ fi
 
 echo "[igra-harness] running deterministic IGRA suite"
 
-cargo test -p foundry-config igra -- --nocapture
+cargo test -p foundry-config igra --lib -- --nocapture
+cargo test -p foundry-cli opts::igra --lib -- --nocapture
+cargo test -p foundry-common igra_exit --lib -- --nocapture
 cargo test -p foundry-common provider::tests -- --nocapture
 cargo test -p foundry-common igra_store -- --nocapture
 cargo test -p foundry-common igra_transport -- --nocapture

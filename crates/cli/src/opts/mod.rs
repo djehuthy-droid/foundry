@@ -1,10 +1,14 @@
+mod igra;
+pub use igra::*;
 mod build;
 mod chain;
 mod dependency;
 mod evm;
 mod global;
 mod rpc;
+mod rpc_common;
 mod tempo;
+mod tracing;
 mod transaction;
 
 pub use build::*;
@@ -13,5 +17,7 @@ pub use dependency::*;
 pub use evm::*;
 pub use global::*;
 pub use rpc::*;
+pub use rpc_common::*;
 pub use tempo::*;
+pub use tracing::*;
 pub use transaction::*;

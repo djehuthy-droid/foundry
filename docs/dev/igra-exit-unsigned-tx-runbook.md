@@ -188,8 +188,10 @@ Create an input file, for example `exit-input.json`:
 
 Rules:
 
-- `script_public_key.script` must be the IGRA KAS locking script:
-  `aa205933185b78c71f0833770ca4aa6b62423af00d0efc2832025a23999543f220f787`.
+- Without `exit_address`, `script_public_key.script` must be the official IGRA KAS locking
+  script: `aa205933185b78c71f0833770ca4aa6b62423af00d0efc2832025a23999543f220f787`.
+  For another custody multisig, supply `exit_address` or `--exit-address`; each input script
+  must match that address and the supplied multisig keys, threshold, and derivation path.
 - `message_id` must be exactly 32 bytes, hex encoded.
 - `recipient` must match the selected network. Use `kaspa:` for mainnet.
 - `sum(locking_utxos.amount_sompi)` must equal `sum(exits.amount_sompi) + fee_sompi`.
@@ -282,6 +284,28 @@ For mainnet:
   --out-json unsigned-exit.json \
   --out-hex unsigned-exit.hex
 ```
+
+For a different custody multisig, derive its address from the existing public wallet keys first:
+
+```bash
+cast igra derive-msig-address --network mainnet --path m/0/0/1 \
+  --keys-file public.json
+cast igra build-exit --network mainnet --tx-id-prefix 97b1 --lane-id 97b10000 \
+  --exit-address "$CUSTODY_ADDRESS" --input exit-input.json \
+  --out-json unsigned-exit.json --out-hex unsigned-exit.hex
+```
+
+`CUSTODY_ADDRESS` is the custody input P2SH address, not a withdrawal recipient. The alias
+`--custody-address` is also accepted. The builder records it as `exit_address` in the manifest;
+a conflicting input JSON address is rejected. All inputs must derive that same address from
+the provided xpubs, quorum, and path, and use its script on the selected network. Change stays
+with the same multisig keys and may use a separate canonical receive path.
+
+Each offline signer should supply their independently known `--exit-address` to `sign-exit`;
+`verify-exit` and `merge-exit` also accept it. This pins custody locally rather than trusting
+an address supplied by the coordinator. Declared custody is validated even without this flag.
+Existing manifests that omit `exit_address` retain the official Igra locking-script default.
+Custom custody requires no test override.
 
 Useful optional flags:
 
@@ -393,9 +417,9 @@ For partially signed files:
   --allow-signatures
 ```
 
-If the artifact was intentionally built from a non-official test multisig UTXO, signers must add
-`--allow-non-igra-lock-script-for-testing` to their verification command. Official bridge exits
-must not use that flag.
+For configured custody, add `--exit-address "$CUSTODY_ADDRESS"` to verification and signing.
+The test-only locking-script override is reserved for legacy fixtures; production custody
+uses the address checks above.
 
 Each signer should inspect:
 
@@ -423,10 +447,10 @@ Every signer can receive the same unsigned manifest and PST, sign independently 
 `cast igra sign-exit`, and return their own PST. The online coordinator combines responses:
 
 ```bash
-cast igra merge-exit --manifest unsigned-exit.json \
+cast igra merge-exit --manifest unsigned-exit.json --exit-address "$CUSTODY_ADDRESS" \
   --hex signer1.hex --hex signer2.hex --out-hex quorum.hex
 cast igra verify-exit --manifest unsigned-exit.json --hex quorum.hex \
-  --allow-signatures --require-fully-signed
+  --exit-address "$CUSTODY_ADDRESS" --allow-signatures --require-fully-signed
 ```
 
 `merge-exit` verifies every supplied signature, requires identical transaction bodies and
@@ -468,18 +492,28 @@ python3 scripts/igra/official-wallet-interop.py \
 The script exercises the actual official `kaspawallet sign --transaction-file` command,
 expects its v1 result to be rejected, then tests three independent Cast signers with the
 same encrypted wallet files, each 2-of-3 combination, all three responses, and duplicates.
+It uses the derived custody address through `--exit-address` without a test-script override.
 It never broadcasts. Keep generated wallets outside the repository. The recorded
 [result](igra-offline-wallet-interop.json) covers two inputs, two withdrawals, and custody
 change, with all three 2-of-3 combinations passing local script validation.
 
-### Deferred upstream maintenance
+### Upstream synchronization
 
-This fork starts from Igra's `igra-canonical-exit-toccata` at
-`ade9374d007ebc35a9380c45542a9a99800bd712`. Merge the official `foundry-rs/foundry`
-upstream in a separate maintenance change, preserving Igra's API and pinned consensus
-semantics. Before promoting that merge, rebuild Cast and rerun native exit tests, the
-Go-wallet compatibility probe, and all independent-signature combinations. Record both
-upstream and Igra commit IDs; do not silently replace the Igra branch with upstream master.
+The Igra base is `igra-canonical-exit-toccata` at
+`ade9374d007ebc35a9380c45542a9a99800bd712`. This branch merges official
+`foundry-rs/foundry` master at `f567f8708daf0cd32ab7953d36e3cc1d0c567acf`
+(Foundry 1.8.6, fetched October 15, 2026), preserving the Igra exit API and transport.
+Upstream moved wallet options into `foundry-core`; the Kaspa CLI options now live in
+Foundry's existing CLI options module and retain explicit Kaspa/config/EVM fallback precedence.
+Multiple fork RPC URLs are rejected in Igra mode because that new upstream path would bypass
+the Igra transport. A single RPC URL remains supported.
+
+The Kaspa dependency is based on official `kaspanet/rusty-kaspa` revision
+`895766fd6e882e5ebf1ede74f9de610d616afa14`. Its four WebAssembly dependency pins are
+updated in the [compatibility branch](https://github.com/djehuthy-droid/rusty-kaspa/tree/compat/foundry-wasm-dependencies)
+to the wasm-bindgen 0.2.112 family required by current Foundry dependencies. Kaspa consensus,
+transaction, and signing source are unchanged. Foundry pins the compatibility commit and
+locks the resolved dependency graph in `Cargo.lock`.
 
 ## Sign With Cast V1 Signer
 
@@ -629,7 +663,7 @@ Before signing or broadcasting:
 2. Manifest protocol payload header is `0x93`.
 3. Kaspa transaction ID starts with the required IGRA prefix.
 4. Every input UTXO exists, is unspent, and has the expected amount.
-5. Every input uses the IGRA KAS locking script.
+5. Every input uses the locally configured custody script (or the official IGRA default).
 6. Every input derivation path is known and correct for that UTXO.
 7. Input total equals exit outputs plus optional change output plus fee.
 8. Recipient addresses are correct mainnet `kaspa:` addresses.

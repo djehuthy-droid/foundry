@@ -153,13 +153,26 @@ impl Error {
     }
 
     /// Returns the raw data of this error.
-    pub fn data(&self) -> &[u8] {
+    pub const fn data(&self) -> &[u8] {
         unsafe { &*self.data }
     }
 
     /// Returns `true` if this error is a human-readable string.
-    pub fn is_str(&self) -> bool {
+    pub const fn is_str(&self) -> bool {
         self.is_str
+    }
+
+    /// Prefixes a string error with the name of the cheatcode that produced it.
+    pub(crate) fn with_cheatcode_name(self, cheat: &spec::Cheatcode<'static>) -> Self {
+        let name = cheat.func.signature.split('(').next().unwrap();
+        // Skip showing the cheatcode name for:
+        // - assertions: too verbose, and can already be inferred from the error message
+        // - `rpcUrl`: forge-std relies on it in `getChainWithUpdatedRpcUrl`
+        if self.is_str && !name.contains("assert") && name != "rpcUrl" {
+            fmt_err!("vm.{name}: {self}")
+        } else {
+            self
+        }
     }
 
     fn new_str(data: &'static str) -> Self {

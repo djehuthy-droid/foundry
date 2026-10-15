@@ -5,16 +5,18 @@ use chacha20poly1305::{
 };
 use clap::{Args, Subcommand};
 use eyre::{Result, WrapErr, bail, eyre};
-use foundry_common::igra_bundle::verify_bundle_integral;
-use foundry_common::igra_exit::{
-    BuildExitInput, BuildExitOptions, MultisigAddressInput, SignExitOptions, VerifyExitOptions,
-    broadcast_wallet_transaction, build_unsigned_exit, check_multisig_derivation_path,
-    decode_wallet_transaction, derive_multisig_address, inspect_exit_wallet_transaction,
-    merge_exit_wallet_transactions, sign_exit_wallet_transaction, verify_multisig_address,
-    verify_unsigned_exit,
+use foundry_common::{
+    igra_bundle::verify_bundle_integral,
+    igra_exit::{
+        BuildExitInput, BuildExitOptions, MultisigAddressInput, SignExitOptions, VerifyExitOptions,
+        broadcast_wallet_transaction, build_unsigned_exit, check_multisig_derivation_path,
+        decode_wallet_transaction, derive_multisig_address, inspect_exit_wallet_transaction,
+        merge_exit_wallet_transactions, sign_exit_wallet_transaction, verify_exit_custody_address,
+        verify_multisig_address, verify_unsigned_exit,
+    },
 };
 use serde::Deserialize;
-use std::{fs, path::PathBuf, time::Duration};
+use std::{fs, io::Write, path::PathBuf, time::Duration};
 
 #[derive(Debug, Args)]
 pub struct IgraArgs {
@@ -55,6 +57,9 @@ pub enum IgraSubcommand {
 
 #[derive(Debug, Args)]
 pub struct BuildExitArgs {
+    /// Expected custody P2SH address derived from the multisig keys and threshold.
+    #[arg(long, alias = "custody-address")]
+    pub exit_address: Option<String>,
     /// Kaspa network. Use `mainnet` for real mainnet exits.
     #[arg(long)]
     pub network: String,
@@ -102,6 +107,9 @@ pub struct BuildExitArgs {
 
 #[derive(Debug, Args)]
 pub struct VerifyExitArgs {
+    /// Expected custody P2SH address derived from the multisig keys and threshold.
+    #[arg(long, alias = "custody-address")]
+    pub exit_address: Option<String>,
     /// JSON manifest produced by `cast igra build-exit`.
     #[arg(long = "manifest", value_hint = clap::ValueHint::FilePath)]
     pub manifest_json: PathBuf,
@@ -133,6 +141,9 @@ pub struct VerifyExitArgs {
 
 #[derive(Debug, Args)]
 pub struct MergeExitArgs {
+    /// Expected custody P2SH address derived from the multisig keys and threshold.
+    #[arg(long, alias = "custody-address")]
+    pub exit_address: Option<String>,
     #[arg(long = "manifest", value_hint = clap::ValueHint::FilePath)]
     pub manifest_json: PathBuf,
     /// Repeat for each independently signed response to the same prepared transaction.
@@ -147,22 +158,18 @@ pub struct MergeExitArgs {
 impl MergeExitArgs {
     fn run(self) -> Result<()> {
         let manifest = serde_json::from_str(&fs::read_to_string(&self.manifest_json)?)?;
-        let inputs = self
-            .hex
-            .iter()
-            .map(fs::read_to_string)
-            .collect::<std::io::Result<Vec<_>>>()?;
+        if let Some(address) = &self.exit_address {
+            verify_exit_custody_address(&manifest, address)?;
+        }
+        let inputs =
+            self.hex.iter().map(fs::read_to_string).collect::<std::io::Result<Vec<_>>>()?;
         let merged = merge_exit_wallet_transactions(
             &manifest,
             &inputs,
             self.allow_non_igra_lock_script_for_testing,
         )?;
         // Never truncate an existing unsigned artifact or signer response.
-        use std::io::Write;
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&self.out_hex)?;
+        let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&self.out_hex)?;
         writeln!(output, "{merged}")?;
         foundry_common::sh_println!("merged wallet hex: {}", self.out_hex.display())?;
         Ok(())
@@ -171,6 +178,9 @@ impl MergeExitArgs {
 
 #[derive(Debug, Args)]
 pub struct SignExitArgs {
+    /// Expected custody P2SH address derived from the multisig keys and threshold.
+    #[arg(long, alias = "custody-address")]
+    pub exit_address: Option<String>,
     /// JSON manifest produced by `cast igra build-exit`.
     #[arg(long = "manifest", value_hint = clap::ValueHint::FilePath)]
     pub manifest_json: PathBuf,
@@ -199,7 +209,8 @@ pub struct SignExitArgs {
     #[arg(long = "keys-password-file", value_hint = clap::ValueHint::FilePath, requires = "keys_file")]
     pub keys_password_file: Option<PathBuf>,
 
-    /// Go kaspawallet keys.json password in cleartext. Prefer the hidden prompt or --keys-password-file.
+    /// Go kaspawallet keys.json password in cleartext. Prefer the hidden prompt or
+    /// --keys-password-file.
     #[arg(
         long = "unsafe-keys-password",
         env = "KASPAWALLET_KEYS_PASSWORD",
@@ -207,7 +218,8 @@ pub struct SignExitArgs {
     )]
     pub unsafe_keys_password: Option<String>,
 
-    /// Drop existing PST signatures before signing. Use to recover from signatures made by the wrong signer.
+    /// Drop existing PST signatures before signing. Use to recover from signatures made by the
+    /// wrong signer.
     #[arg(long)]
     pub clear_existing_signatures: bool,
 
@@ -352,7 +364,13 @@ impl BuildExitArgs {
         }
 
         let input_json = fs::read_to_string(&self.input)?;
-        let input: BuildExitInput = serde_json::from_str(&input_json)?;
+        let mut input: BuildExitInput = serde_json::from_str(&input_json)?;
+        if let Some(address) = self.exit_address {
+            if input.exit_address.as_ref().is_some_and(|existing| existing != &address) {
+                bail!("--exit-address conflicts with input JSON exit_address");
+            }
+            input.exit_address = Some(address);
+        }
         let output = build_unsigned_exit(
             input,
             BuildExitOptions {
@@ -393,6 +411,9 @@ impl VerifyExitArgs {
     async fn run(self) -> Result<()> {
         let manifest_json = fs::read_to_string(&self.manifest_json)?;
         let manifest = serde_json::from_str(&manifest_json)?;
+        if let Some(address) = &self.exit_address {
+            verify_exit_custody_address(&manifest, address)?;
+        }
         let wallet_hex = fs::read_to_string(&self.hex)?;
         let allow_signatures = self.allow_signatures || self.broadcast;
         let require_fully_signed = self.require_fully_signed || self.broadcast;
@@ -460,6 +481,9 @@ impl SignExitArgs {
 
         let manifest_json = fs::read_to_string(&self.manifest_json)?;
         let manifest = serde_json::from_str(&manifest_json)?;
+        if let Some(address) = &self.exit_address {
+            verify_exit_custody_address(&manifest, address)?;
+        }
         let wallet_hex = fs::read_to_string(&self.hex)?;
         let mut mnemonics = Vec::new();
         let mut go_kaspawallet_mnemonics = Vec::new();

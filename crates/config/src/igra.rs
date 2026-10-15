@@ -1,8 +1,8 @@
 //! Configuration for IGRA mode.
 
-use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 
 /// Kaspa signer source configuration for IGRA write-path submission.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

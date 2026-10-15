@@ -19,11 +19,10 @@ use foundry_config::{Config, IgraKaspaWalletConfig};
 use kaspa_addresses::{
     Address as KaspaAddress, Prefix as KaspaAddressPrefix, Version as KaspaAddressVersion,
 };
-use kaspa_bip32::secp256k1::SecretKey as KaspaSecretKey;
 use kaspa_bip32::{
     ChildNumber as KaspaChildNumber, DerivationPath as KaspaDerivationPath,
     ExtendedPrivateKey as KaspaExtendedPrivateKey, Language as KaspaLanguage,
-    Mnemonic as KaspaMnemonic,
+    Mnemonic as KaspaMnemonic, secp256k1::SecretKey as KaspaSecretKey,
 };
 use kaspa_consensus_core::{
     config::params::Params as KaspaParams,
@@ -198,7 +197,8 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
                 .load_utxos(&mut client, rpc_url, network, &source_address, force_refresh)
                 .await?;
 
-            // Allow one forced refresh pass in case the cache is stale or the node just finished syncing.
+            // Allow one forced refresh pass in case the cache is stale or the node just finished
+            // syncing.
             if utxos.is_empty() {
                 if !force_refresh {
                     continue;
@@ -650,7 +650,8 @@ impl<T> IgraTransport<T> {
         };
         let raw_tx = Self::raw_tx_bytes(request)?;
         // Validate tx type up-front so we can fail before doing any expensive Kaspa work.
-        // We no longer embed the tx type in the payload (kaswallet format is payload == raw_l2_tx || nonce_le_u64).
+        // We no longer embed the tx type in the payload (kaswallet format is payload == raw_l2_tx
+        // || nonce_le_u64).
         let _tx_type_nibble = Self::raw_tx_type(request)?
             .tx_type_nibble()
             .ok_or_else(|| "unsupported tx type for IGRA payload header".to_string())?;
@@ -1396,11 +1397,13 @@ mod tests {
     use kaspa_consensus_core::tx::{ScriptPublicKey, TransactionId};
     use kaspa_rpc_core::{RpcTransactionOutpoint, RpcUtxoEntry, RpcUtxosByAddressesEntry};
     use serde_json::value::RawValue;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
-    use std::time::Duration;
     use tower::Service;
 
     #[test]
@@ -1466,8 +1469,8 @@ mod tests {
             println!("{name}: {address}{}", if address == expected { "  <== MATCH" } else { "" });
         }
 
-        // Some CLIs display a 4-byte account id/fingerprint that might also be used as the account index.
-        // The sample CLI output shows `[1a1f47ce]`.
+        // Some CLIs display a 4-byte account id/fingerprint that might also be used as the account
+        // index. The sample CLI output shows `[1a1f47ce]`.
         let maybe_account_index = 0x1a1f_47ceu32;
         let maybe_path = format!("m/44'/111111'/{maybe_account_index}'/0/0");
         let maybe_key = resolve_mnemonic_private_key(mnemonic, None, Some(&maybe_path), 0)

@@ -30,9 +30,10 @@ def main():
     helper = Path(__file__).with_name("official-wallet-fixture.go").resolve()
     run(["go", "run", helper, work], cwd=args.kaspad_source)
     cast = [args.cast, "igra"]
-    testing = ["--allow-non-igra-lock-script-for-testing"]
+
     address = json.loads(run(cast + ["derive-msig-address", "--network", "mainnet",
                                     "--path", "m/0/0/1", "--keys-file", work / "public.json"]))
+    custody_args = ["--exit-address", address["address"]]
     public = json.loads((work / "public.json").read_text())
     build_input = {
         "locking_utxos": [{"transaction_id": "11" * 32, "index": 0,
@@ -58,9 +59,18 @@ def main():
     unsigned = work / "unsigned.hex"
     run(cast + ["build-exit", "--network", "mainnet", "--tx-id-prefix", "97b1",
                 "--lane-id", "97b10000", "--input", work / "input.json",
-                "--out-json", manifest, "--out-hex", unsigned] + testing)
-    verify = cast + ["verify-exit", "--manifest", manifest] + testing
+                "--out-json", manifest, "--out-hex", unsigned] + custody_args)
+    verify = cast + ["verify-exit", "--manifest", manifest] + custody_args
     run(verify + ["--hex", unsigned])
+    declared = json.loads(manifest.read_text())
+    assert declared["exit_address"] == address["address"]
+    other_address = json.loads(run(cast + ["derive-msig-address", "--network", "mainnet",
+                                          "--path", "m/0/0/2", "--keys-file", work / "public.json"]))
+    wrong_pin = subprocess.run([str(x) for x in cast + ["verify-exit", "--manifest", manifest,
+                               "--hex", unsigned, "--exit-address", other_address["address"]]],
+                               text=True, capture_output=True)
+    if wrong_pin.returncode == 0 or "does not match configured custody address" not in wrong_pin.stderr:
+        raise RuntimeError("Unexpected custody-pin validation result: " + wrong_pin.stderr)
 
     # Actual stock CLI invocation; success here is NOT proof of a valid v1 signature.
     go_signed = run([args.wallet, "sign", "--keys-file", work / "signer1.keys.json",
@@ -84,14 +94,14 @@ def main():
         response = work / f"cast-signed-{i}.hex"
         run(cast + ["sign-exit", "--manifest", manifest, "--hex", unsigned,
                     "--keys-file", work / f"signer{i}.keys.json",
-                    "--keys-password-file", work / "password.txt", "--out-hex", response] + testing)
+                    "--keys-password-file", work / "password.txt", "--out-hex", response] + custody_args)
         run(verify + ["--hex", response, "--allow-signatures"])
         responses.append(response)
     merged_reports = {}
     for name, indices in [("12", [0, 1]), ("13", [0, 2]), ("23", [1, 2]),
                           ("123", [0, 1, 2]), ("duplicate", [0, 1, 0])]:
         output = work / f"merged-{name}.hex"
-        command = cast + ["merge-exit", "--manifest", manifest, "--out-hex", output] + testing
+        command = cast + ["merge-exit", "--manifest", manifest, "--out-hex", output] + custody_args
         for i in indices:
             command += ["--hex", responses[i]]
         run(command)
@@ -113,6 +123,9 @@ def main():
         "independent_cast_signers": 3,
         "merged_quorums": merged_reports,
         "kaspa_tx_id": expected_id,
+        "configured_exit_address": address["address"],
+        "test_script_override_used": False,
+        "wrong_custody_pin_rejected": True,
         "broadcast": False,
         "fixture": "Disposable keys; nonexistent input; local script validation only",
     }

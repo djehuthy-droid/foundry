@@ -49,7 +49,7 @@ use kaspa_txscript::{
 };
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256, Sha512};
+use sha2_10::{Digest, Sha256, Sha512};
 use std::{str::FromStr, time::Duration};
 
 pub const IGRA_PROTOCOL_VERSION: u8 = 0x9;
@@ -89,6 +89,9 @@ pub struct VerifyExitOptions {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BuildExitInput {
+    /// Custody P2SH address derived from this multisig, not a withdrawal recipient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_address: Option<String>,
     pub locking_utxos: Vec<LockingUtxo>,
     pub exits: Vec<ExitRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -163,6 +166,8 @@ pub struct MultisigSpec {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UnsignedExitManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_address: Option<String>,
     pub schema: String,
     pub network: String,
     pub protocol: ExitProtocolManifest,
@@ -499,6 +504,7 @@ pub fn build_unsigned_exit(
     input.multisig.extended_public_keys.sort();
 
     let network_prefix = parse_network_prefix(&options.network)?;
+    validate_exit_custody(&input, network_prefix)?;
     validate_human_readable_addresses(&input, network_prefix)?;
     enrich_human_readable_fields(&mut input, network_prefix)?;
     let tx_id_prefix = decode_fixed_hex(&options.tx_id_prefix, "tx-id prefix")?;
@@ -563,6 +569,7 @@ pub fn build_unsigned_exit(
     let kaspa_tx_id = tx.id().to_string();
 
     let manifest = UnsignedExitManifest {
+        exit_address: input.exit_address.clone(),
         schema: CURRENT_UNSIGNED_EXIT_SCHEMA.to_string(),
         network: options.network,
         protocol: ExitProtocolManifest {
@@ -609,6 +616,7 @@ pub fn verify_unsigned_exit(
     }
     validate_build_input(
         &BuildExitInput {
+            exit_address: manifest.exit_address.clone(),
             locking_utxos: manifest.locking_utxos.clone(),
             exits: manifest.exits.clone(),
             change: manifest.change.clone(),
@@ -620,6 +628,7 @@ pub fn verify_unsigned_exit(
     )?;
     validate_human_readable_addresses(
         &BuildExitInput {
+            exit_address: manifest.exit_address.clone(),
             locking_utxos: manifest.locking_utxos.clone(),
             exits: manifest.exits.clone(),
             change: manifest.change.clone(),
@@ -640,6 +649,10 @@ pub fn verify_unsigned_exit(
         "total_output_kas",
     )?;
 
+    validate_exit_custody(
+        &build_input_from_manifest(manifest),
+        parse_network_prefix(&manifest.network)?,
+    )?;
     let wallet_bytes = decode_wallet_hex(wallet_hex)?;
     let actual_sha256 = prefixed_hex(&Sha256::digest(wallet_hex.trim().as_bytes()));
     if !options.allow_signatures && actual_sha256 != manifest.wallet.hex_sha256 {
@@ -795,9 +808,8 @@ fn verify_exit_partial_signatures(
             {
                 bail!("input {index} has an invalid signature encoding or sighash type");
             }
-            let key = pair
-                .extended_pub_key
-                .parse::<KaspaExtendedPublicKey<KaspaSecpPublicKey>>()?;
+            let key =
+                pair.extended_pub_key.parse::<KaspaExtendedPublicKey<KaspaSecpPublicKey>>()?;
             let result = if manifest.multisig.ecdsa {
                 let digest =
                     calc_ecdsa_signature_hash(&populated, index, KASPA_SIG_HASH_ALL, &reused);
@@ -849,10 +861,8 @@ pub fn merge_exit_wallet_transactions(
             if target.tx != incoming.tx {
                 bail!("offline responses contain different transaction bodies");
             }
-            for (input, other) in target
-                .partially_signed_inputs
-                .iter_mut()
-                .zip(incoming.partially_signed_inputs)
+            for (input, other) in
+                target.partially_signed_inputs.iter_mut().zip(incoming.partially_signed_inputs)
             {
                 let mut unsigned_input = input.clone();
                 let mut unsigned_other = other.clone();
@@ -865,10 +875,8 @@ pub fn merge_exit_wallet_transactions(
                 if unsigned_input != unsigned_other {
                     bail!("offline responses contain different signing metadata");
                 }
-                for (pair, other_pair) in input
-                    .pub_key_signature_pairs
-                    .iter_mut()
-                    .zip(other.pub_key_signature_pairs)
+                for (pair, other_pair) in
+                    input.pub_key_signature_pairs.iter_mut().zip(other.pub_key_signature_pairs)
                 {
                     if other_pair.signature.is_empty() {
                         continue;
@@ -1120,9 +1128,7 @@ pub fn materialize_signed_wallet_transaction(
 
         let mut script_builder = ScriptBuilder::new();
         if manifest.multisig.extended_public_keys.len() > 1 {
-            for signature in signatures
-                .into_iter()
-                .take(partial_input.minimum_signatures as usize)
+            for signature in signatures.into_iter().take(partial_input.minimum_signatures as usize)
             {
                 script_builder.add_data(signature)?;
             }
@@ -1475,6 +1481,55 @@ fn validate_multisig_address_input(input: &MultisigAddressInput) -> Result<()> {
     Ok(())
 }
 
+/// Assert the operator's locally configured custody address before signing/importing.
+pub fn verify_exit_custody_address(manifest: &UnsignedExitManifest, expected: &str) -> Result<()> {
+    let expected = KaspaAddress::try_from(expected)?;
+    let network = parse_network_prefix(&manifest.network)?;
+    if expected.prefix != network {
+        bail!("exit address network mismatch");
+    }
+    let actual = if let Some(address) = &manifest.exit_address {
+        pay_to_address_script(&KaspaAddress::try_from(address.as_str())?)
+    } else {
+        ScriptPublicKey::new(0, kas_locking_script()?.into())
+    };
+    if actual != pay_to_address_script(&expected) {
+        bail!("manifest exit address does not match configured custody address");
+    }
+    validate_exit_custody(&build_input_from_manifest(manifest), network)
+}
+
+fn validate_exit_custody(input: &BuildExitInput, network: KaspaAddressPrefix) -> Result<()> {
+    let Some(address) = &input.exit_address else {
+        return Ok(());
+    };
+    let address = KaspaAddress::try_from(address.as_str())?;
+    if address.prefix != network {
+        bail!("exit address network mismatch");
+    }
+    let expected = pay_to_address_script(&address);
+    let mut multisig = input.multisig.clone();
+    multisig.extended_public_keys.sort();
+    for (index, utxo) in input.locking_utxos.iter().enumerate() {
+        let derived = pay_to_script_hash_script(&multisig_redeem_script_for_path(
+            &multisig,
+            &utxo.derivation_path,
+        )?);
+        if derived != expected {
+            bail!(
+                "exit address does not match multisig keys, threshold and derivation path for input {index}"
+            );
+        }
+        if utxo.script_public_key.version != expected.version()
+            || decode_fixed_hex(&utxo.script_public_key.script, "locking UTXO script")?.as_slice()
+                != expected.script()
+        {
+            bail!("input {index} locking script does not match configured exit address");
+        }
+    }
+    Ok(())
+}
+
 fn validate_build_input(
     input: &BuildExitInput,
     allow_non_igra_lock_script_for_testing: bool,
@@ -1518,7 +1573,8 @@ fn validate_build_input(
             )?;
         }
         let script = decode_fixed_hex(&utxo.script_public_key.script, "locking UTXO script")?;
-        if !allow_non_igra_lock_script_for_testing
+        if input.exit_address.is_none()
+            && !allow_non_igra_lock_script_for_testing
             && (utxo.script_public_key.version != 0 || script != locking_script)
         {
             bail!(
@@ -1717,7 +1773,10 @@ fn verify_inputs(
         {
             bail!("partial input {index} prevOutput script mismatch");
         }
-        if !allow_non_igra_lock_script_for_testing && prev_spk.script != locking_script {
+        if manifest.exit_address.is_none()
+            && !allow_non_igra_lock_script_for_testing
+            && prev_spk.script != locking_script
+        {
             bail!("partial input {index} prevOutput is not the IGRA KAS locking script");
         }
         if partial_input.minimum_signatures != manifest.multisig.minimum_signatures {
@@ -1815,6 +1874,7 @@ fn validate_mass_manifest_passes(mass: &KaspaMassManifest) -> Result<()> {
 
 fn build_input_from_manifest(manifest: &UnsignedExitManifest) -> BuildExitInput {
     BuildExitInput {
+        exit_address: manifest.exit_address.clone(),
         locking_utxos: manifest.locking_utxos.clone(),
         exits: manifest.exits.clone(),
         change: manifest.change.clone(),
@@ -2974,6 +3034,7 @@ mod tests {
 
     fn sample_input() -> BuildExitInput {
         BuildExitInput {
+            exit_address: None,
             locking_utxos: vec![LockingUtxo {
                 transaction_id: "1111111111111111111111111111111111111111111111111111111111111111"
                     .to_string(),
@@ -3559,6 +3620,38 @@ mod tests {
     }
 
     #[test]
+    fn configured_custody_requires_matching_keys_threshold_path_script_and_network() {
+        let mut input = sample_input();
+        let address = derive_multisig_address(MultisigAddressInput {
+            network: "mainnet".into(),
+            derivation_path: input.locking_utxos[0].derivation_path.clone(),
+            minimum_signatures: input.multisig.minimum_signatures,
+            extended_public_keys: input.multisig.extended_public_keys.clone(),
+            ecdsa: false,
+        })
+        .unwrap();
+        input.exit_address = Some(address.address);
+        input.locking_utxos[0].script_public_key = address.script_public_key;
+        validate_build_input(&input, false).unwrap();
+        validate_exit_custody(&input, KaspaAddressPrefix::Mainnet).unwrap();
+        input.multisig.extended_public_keys.reverse();
+        validate_exit_custody(&input, KaspaAddressPrefix::Mainnet).unwrap();
+        assert!(validate_exit_custody(&input, KaspaAddressPrefix::Devnet).is_err());
+        let mut wrong = input.clone();
+        wrong.multisig.minimum_signatures = 1;
+        assert!(validate_exit_custody(&wrong, KaspaAddressPrefix::Mainnet).is_err());
+        let mut wrong = input.clone();
+        wrong.multisig.extended_public_keys.pop();
+        assert!(validate_exit_custody(&wrong, KaspaAddressPrefix::Mainnet).is_err());
+        let mut wrong = input.clone();
+        wrong.locking_utxos[0].derivation_path = "m/0/0/2".into();
+        assert!(validate_exit_custody(&wrong, KaspaAddressPrefix::Mainnet).is_err());
+        let mut wrong = input;
+        wrong.locking_utxos[0].script_public_key.script = KAS_LOCKING_SCRIPT_HEX.into();
+        assert!(validate_exit_custody(&wrong, KaspaAddressPrefix::Mainnet).is_err());
+    }
+
+    #[test]
     fn sign_exit_adds_v1_valid_multisig_signatures() {
         let mut input = sample_input();
         let lock_report = derive_multisig_address(MultisigAddressInput {
@@ -3569,6 +3662,7 @@ mod tests {
             ecdsa: false,
         })
         .expect("derive test multisig lock script");
+        input.exit_address = Some(lock_report.address.clone());
         input.locking_utxos[0].address = Some(lock_report.address);
         input.locking_utxos[0].script_public_key = lock_report.script_public_key;
 
@@ -3580,7 +3674,7 @@ mod tests {
                 lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(30),
                 max_nonce: Some(1_000_000),
-                allow_non_igra_lock_script_for_testing: true,
+                allow_non_igra_lock_script_for_testing: false,
                 allow_mass_limit_override_for_testing: false,
             },
         )
@@ -3593,7 +3687,7 @@ mod tests {
                 master_private_keys: vec![
                     "kprv5y2qurMHCsXYqr9oKku3Ry75DcZgdraE3SFPPh1SKp4qKtr61qQeNypYTGztwUUiVauHWmjxaQXeUKHxj4QCuDG4ULpZHkvBoH9XX19ynXm".to_string(),
                 ],
-                allow_non_igra_lock_script_for_testing: true,
+                allow_non_igra_lock_script_for_testing: false,
                 ..SignExitOptions::default()
             },
         )
@@ -3610,7 +3704,7 @@ mod tests {
                 master_private_keys: vec![
                     "kprv5y2qurMHCsXYqr9oKku3Ry75DcZgdraE3SFPPh1SKp4qKtr61qQeNypYTGztwUUiVauHWmjxaQXeUKHxj4QCuDG4ULpZHkvBoH9XX19ynXm".to_string(),
                 ],
-                allow_non_igra_lock_script_for_testing: true,
+                allow_non_igra_lock_script_for_testing: false,
                 ..SignExitOptions::default()
             },
         )
@@ -3626,7 +3720,7 @@ mod tests {
                 master_private_keys: vec![
                     "kprv61JFuZekJ8eXzTHWXWmgK1DBYS831w4Ej3gHMnPZJ1G7hB9GS4wjW8AxEYMEMBrgCdnyt54pxmNXC5KgNegPhHLaYDVhXid5WHnNxE7Nir6".to_string(),
                 ],
-                allow_non_igra_lock_script_for_testing: true,
+                allow_non_igra_lock_script_for_testing: false,
                 ..SignExitOptions::default()
             },
         )
@@ -3639,7 +3733,7 @@ mod tests {
                 master_private_keys: vec![
                     "kprv61JFuZekJ8eXzTHWXWmgK1DBYS831w4Ej3gHMnPZJ1G7hB9GS4wjW8AxEYMEMBrgCdnyt54pxmNXC5KgNegPhHLaYDVhXid5WHnNxE7Nir6".to_string(),
                 ],
-                allow_non_igra_lock_script_for_testing: true,
+                allow_non_igra_lock_script_for_testing: false,
                 ..SignExitOptions::default()
             },
         ).expect("sign independently");
@@ -3650,7 +3744,7 @@ mod tests {
                 independent_2.wallet_hex.clone(),
                 signed_1.wallet_hex.clone(),
             ],
-            true,
+            false,
         )
         .expect("merge independent and duplicate responses");
         let merged_report = verify_unsigned_exit(
@@ -3659,18 +3753,15 @@ mod tests {
             VerifyExitOptions {
                 allow_signatures: true,
                 require_fully_signed: true,
-                allow_non_igra_lock_script_for_testing: true,
+                allow_non_igra_lock_script_for_testing: false,
             },
         )
         .expect("merged quorum executes scripts");
-        assert_eq!(
-            merged_report.kaspa_tx_id,
-            output.manifest.protocol.kaspa_tx_id
-        );
+        assert_eq!(merged_report.kaspa_tx_id, output.manifest.protocol.kaspa_tx_id);
         let reversed = merge_exit_wallet_transactions(
             &output.manifest,
             &[independent_2.wallet_hex, signed_1.wallet_hex.clone()],
-            true,
+            false,
         )
         .unwrap();
         assert_eq!(merged, reversed);
@@ -3689,7 +3780,7 @@ mod tests {
         let error = merge_exit_wallet_transactions(
             &output.manifest,
             &[hex::encode(corrupt.encode_to_vec())],
-            true,
+            false,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("invalid partial signature"));
@@ -3703,11 +3794,11 @@ mod tests {
             merge_exit_wallet_transactions(
                 &output.manifest,
                 &[hex::encode(changed.encode_to_vec())],
-                true
+                false
             )
             .is_err()
         );
-        assert!(merge_exit_wallet_transactions(&output.manifest, &[], true).is_err());
+        assert!(merge_exit_wallet_transactions(&output.manifest, &[], false).is_err());
 
         assert_eq!(signed_2.signed_pairs_added, 1);
         assert!(signed_2.fully_signed);
@@ -3717,7 +3808,7 @@ mod tests {
             VerifyExitOptions {
                 allow_signatures: true,
                 require_fully_signed: true,
-                allow_non_igra_lock_script_for_testing: true,
+                allow_non_igra_lock_script_for_testing: false,
             },
         )
         .expect("fully signed tx verifies scripts");

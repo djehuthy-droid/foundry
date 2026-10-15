@@ -1,7 +1,7 @@
 use eyre::{Result, bail, eyre};
 use serde::Serialize;
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
+use sha2_10::{Digest, Sha256};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct VerifyBundleIntegralReport {

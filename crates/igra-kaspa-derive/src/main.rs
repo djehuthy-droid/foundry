@@ -2,11 +2,10 @@ use clap::Parser;
 use kaspa_addresses::{
     Address as KaspaAddress, Prefix as KaspaAddressPrefix, Version as KaspaAddressVersion,
 };
-use kaspa_bip32::secp256k1::SecretKey as KaspaSecretKey;
 use kaspa_bip32::{
     ChildNumber as KaspaChildNumber, DerivationPath as KaspaDerivationPath,
     ExtendedPrivateKey as KaspaExtendedPrivateKey, Language as KaspaLanguage,
-    Mnemonic as KaspaMnemonic,
+    Mnemonic as KaspaMnemonic, secp256k1::SecretKey as KaspaSecretKey,
 };
 
 #[derive(Debug, Parser)]

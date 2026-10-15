@@ -2,16 +2,19 @@ use super::{
     build::BuildArgs, coverage::CoverageArgs, doc::DocArgs, fmt::FmtArgs,
     snapshot::GasSnapshotArgs, test::TestArgs,
 };
-use alloy_primitives::map::HashSet;
-use clap::Parser;
+use crate::opts::Forge;
+use alloy_primitives::map::{HashMap, HashSet};
+use clap::{CommandFactory, Parser};
 use eyre::Result;
 use foundry_cli::utils::{self, FoundryPathExt, LoadConfig};
 use foundry_config::Config;
 use parking_lot::Mutex;
 use std::{
+    ffi::{OsStr, OsString},
+    io::IsTerminal,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, OnceLock, Weak,
         atomic::{AtomicU8, Ordering},
     },
     time::Duration,
@@ -25,13 +28,44 @@ use watchexec::{
     paths::summarise_events_to_env,
 };
 use watchexec_events::{
-    Event, Priority, ProcessEnd, Tag,
+    Event, KeyCode, Keyboard, Priority, ProcessEnd, Tag,
     filekind::{AccessKind, FileEventKind},
 };
 use watchexec_signals::Signal;
 use yansi::{Color, Paint};
 
 type SpawnHook = Arc<dyn Fn(&[Event], &mut TokioCommand) + Send + Sync + 'static>;
+type KeyboardConfig = Arc<OnceLock<Weak<watchexec::Config>>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyboardAction {
+    Rerun,
+    Quit,
+}
+
+fn keyboard_action(events: &[Event]) -> Option<KeyboardAction> {
+    let mut rerun = false;
+
+    for tag in events.iter().flat_map(|event| &event.tags) {
+        match tag {
+            Tag::Keyboard(Keyboard::Eof) => return Some(KeyboardAction::Quit),
+            Tag::Keyboard(Keyboard::Key { key: KeyCode::Char('a'), modifiers })
+                if modifiers.is_empty() =>
+            {
+                rerun = true;
+            }
+            _ => {}
+        }
+    }
+
+    rerun.then_some(KeyboardAction::Rerun)
+}
+
+fn set_keyboard_events(config: &Option<KeyboardConfig>, enable: bool) {
+    if let Some(config) = config.as_ref().and_then(|config| config.get()).and_then(Weak::upgrade) {
+        config.keyboard_events(enable);
+    }
+}
 
 #[derive(Clone, Debug, Default, Parser)]
 #[command(next_help_heading = "Watch options")]
@@ -85,25 +119,34 @@ impl WatchArgs {
         &self,
         default_paths: impl FnOnce() -> Result<PS>,
     ) -> Result<watchexec::Config> {
-        self.watchexec_config_generic(default_paths, None)
+        self.watchexec_config_generic(default_paths, None, None)
     }
 
-    /// Creates a new [`watchexec::Config`] with a custom command spawn hook.
+    /// Creates a new [`watchexec::Config`] with a custom command spawn hook and optional keyboard
+    /// events while the command is idle.
     ///
     /// If paths were provided as arguments the these will be used as the watcher's pathset,
     /// otherwise the path the closure returns will be used.
-    pub fn watchexec_config_with_override<PS: IntoIterator<Item = P>, P: Into<PathBuf>>(
+    fn watchexec_config_with_override<PS: IntoIterator<Item = P>, P: Into<PathBuf>>(
         &self,
         default_paths: impl FnOnce() -> Result<PS>,
+        watch_keyboard: bool,
         spawn_hook: impl Fn(&[Event], &mut TokioCommand) + Send + Sync + 'static,
-    ) -> Result<watchexec::Config> {
-        self.watchexec_config_generic(default_paths, Some(Arc::new(spawn_hook)))
+    ) -> Result<(watchexec::Config, Option<KeyboardConfig>)> {
+        let keyboard_config = watch_keyboard.then(|| Arc::new(OnceLock::new()));
+        let config = self.watchexec_config_generic(
+            default_paths,
+            Some(Arc::new(spawn_hook)),
+            keyboard_config.clone(),
+        )?;
+        Ok((config, keyboard_config))
     }
 
     fn watchexec_config_generic<PS: IntoIterator<Item = P>, P: Into<PathBuf>>(
         &self,
         default_paths: impl FnOnce() -> Result<PS>,
         spawn_hook: Option<SpawnHook>,
+        keyboard_config: Option<KeyboardConfig>,
     ) -> Result<watchexec::Config> {
         let mut paths = self.watch.as_deref().unwrap_or_default();
         let storage: Vec<_>;
@@ -111,13 +154,14 @@ impl WatchArgs {
             storage = default_paths()?.into_iter().map(Into::into).filter(|p| p.exists()).collect();
             paths = &storage;
         }
-        self.watchexec_config_inner(paths, spawn_hook)
+        self.watchexec_config_inner(paths, spawn_hook, keyboard_config)
     }
 
     fn watchexec_config_inner(
         &self,
         paths: &[PathBuf],
         spawn_hook: Option<SpawnHook>,
+        keyboard_config: Option<KeyboardConfig>,
     ) -> Result<watchexec::Config> {
         let config = watchexec::Config::default();
 
@@ -131,8 +175,7 @@ impl WatchArgs {
 
         config.pathset(paths.iter().map(|p| p.as_path()));
 
-        let n_path_args = self.watch.as_deref().unwrap_or_default().len();
-        let base_command = Arc::new(watch_command(cmd_args(n_path_args)));
+        let base_command = Arc::new(watch_command(cmd_args())?);
 
         let id = watchexec::Id::default();
         let quit_again = Arc::new(AtomicU8::new(0));
@@ -178,18 +221,25 @@ impl WatchArgs {
             };
 
             let signals = action.signals().collect::<Vec<_>>();
+            let keyboard_action = keyboard_action(&action.events);
 
-            if signals.contains(&Signal::Terminate) || signals.contains(&Signal::Interrupt) {
+            if signals.contains(&Signal::Terminate)
+                || signals.contains(&Signal::Interrupt)
+                || keyboard_action == Some(KeyboardAction::Quit)
+            {
                 return quit(action);
             }
 
-            // Only filesystem events below here (or empty synthetic events).
-            if action.paths().next().is_none() && !action.events.iter().any(|e| e.is_empty()) {
-                debug!("no filesystem or synthetic events, skip without doing more");
+            // Only filesystem, keyboard rerun, or empty synthetic events below here.
+            if action.paths().next().is_none()
+                && keyboard_action != Some(KeyboardAction::Rerun)
+                && !action.events.iter().any(|e| e.is_empty())
+            {
+                debug!("no filesystem, rerun, or synthetic events, skip without doing more");
                 return action;
             }
 
-            if cfg!(target_os = "linux") {
+            if cfg!(target_os = "linux") && keyboard_action != Some(KeyboardAction::Rerun) {
                 // Reading a file now triggers `Access(Open)` events on Linux due to:
                 // https://github.com/notify-rs/notify/pull/612
                 // This causes an infinite rebuild loop: the build reads a file,
@@ -201,14 +251,13 @@ impl WatchArgs {
                     if e.is_empty() {
                         has_synthetic_events = true;
                         break;
-                    } else {
-                        for tag in &e.tags {
-                            if let Tag::FileEventKind(kind) = tag
-                                && !matches!(kind, FileEventKind::Access(AccessKind::Open(_))) {
-                                    has_file_events = true;
-                                    break 'outer;
-                                }
-                        }
+                    }
+                    for tag in &e.tags {
+                        if let Tag::FileEventKind(kind) = tag
+                            && !matches!(kind, FileEventKind::Access(AccessKind::Open(_))) {
+                                has_file_events = true;
+                                break 'outer;
+                            }
                     }
                 }
                 if !has_file_events && !has_synthetic_events {
@@ -217,8 +266,13 @@ impl WatchArgs {
                 }
             }
 
+            // Let the child own stdin while it runs. This keeps prompts and the debugger from
+            // racing Watchexec's keyboard event source for terminal input.
+            set_keyboard_events(&keyboard_config, false);
+
             job.run({
                 let job = job.clone();
+                let keyboard_config = keyboard_config.clone();
                 move |context| {
                     if context.current.is_running() && no_restart {
                         return;
@@ -228,7 +282,7 @@ impl WatchArgs {
                         let job = job.clone();
                         move |context| {
                             clear_screen();
-                            setup_process(job, &context.command)
+                            setup_process(job, &context.command, keyboard_config)
                         }
                     });
                 }
@@ -241,14 +295,14 @@ impl WatchArgs {
     }
 }
 
-fn setup_process(job: Job, _command: &Command) {
+fn setup_process(job: Job, _command: &Command, keyboard_config: Option<KeyboardConfig>) {
     tokio::spawn(async move {
         job.to_wait().await;
-        job.run(move |context| end_of_process(context.current));
+        job.run(move |context| end_of_process(context.current, keyboard_config));
     });
 }
 
-fn end_of_process(state: &CommandState) {
+fn end_of_process(state: &CommandState, keyboard_config: Option<KeyboardConfig>) {
     let CommandState::Finished { status, started, finished } = state else {
         return;
     };
@@ -270,6 +324,7 @@ fn end_of_process(state: &CommandState) {
     };
 
     let quiet = false;
+    set_keyboard_events(&keyboard_config, true);
     if !quiet {
         let _ = sh_eprintln!("{}", format!("[{msg}]").paint(fg.foreground()));
     }
@@ -277,7 +332,17 @@ fn end_of_process(state: &CommandState) {
 
 /// Runs the given [`watchexec::Config`].
 pub async fn run(config: watchexec::Config) -> Result<()> {
+    run_inner(config, None).await
+}
+
+async fn run_inner(
+    config: watchexec::Config,
+    keyboard_config: Option<KeyboardConfig>,
+) -> Result<()> {
     let wx = Watchexec::with_config(config)?;
+    if let Some(config) = keyboard_config {
+        debug_assert!(config.set(Arc::downgrade(&wx.config)).is_ok());
+    }
     wx.send_event(Event::default(), Priority::Urgent).await?;
     wx.main().await??;
     Ok(())
@@ -312,10 +377,16 @@ pub async fn watch_test(args: TestArgs) -> Result<()> {
     let project_root = config.root.to_string_lossy().into_owned();
     let test_failures_file = config.test_failures_file.clone();
     let rerun_failed = args.watch.rerun_failed;
+    let watch_keyboard = std::io::stdin().is_terminal();
 
-    let config = args.watch.watchexec_config_with_override(
+    let (config, keyboard_config) = args.watch.watchexec_config_with_override(
         || Ok([&config.test, &config.src]),
+        watch_keyboard,
         move |events, command| {
+            if keyboard_action(events) == Some(KeyboardAction::Rerun) {
+                return;
+            }
+
             // Check if we should prioritize rerunning failed tests
             let has_failures = rerun_failed && test_failures_file.exists();
 
@@ -366,10 +437,17 @@ pub async fn watch_test(args: TestArgs) -> Result<()> {
             }
         },
     )?;
-    run(config).await
+
+    if watch_keyboard {
+        let _ = sh_eprintln!("[Press 'a' to rerun all tests]");
+    }
+
+    run_inner(config, keyboard_config).await
 }
 
 pub async fn watch_coverage(args: CoverageArgs) -> Result<()> {
+    args.ensure_mode_compatible()?;
+
     let config = args.watch().watchexec_config(|| {
         let config = args.load_config()?;
         Ok([config.test, config.src])
@@ -385,11 +463,66 @@ pub async fn watch_fmt(args: FmtArgs) -> Result<()> {
     run(config).await
 }
 
-/// Executes a [`Watchexec`] that listens for changes in the project's sources directory
+/// Executes a [`Watchexec`] that listens for changes affecting the generated
+/// documentation: project sources, optionally library sources, the README that
+/// becomes the homepage, the deployments directory, and the foundry config file
+/// itself. Without these, the live preview goes silently stale on common edits.
 pub async fn watch_doc(args: DocArgs) -> Result<()> {
+    let include_libraries = args.include_libraries;
+    let deployments_arg = args.deployments.clone();
     let config = args.watch.watchexec_config(|| {
         let config = args.config()?;
-        Ok([config.src])
+        let root = config.root.clone();
+
+        let mut paths = Vec::new();
+
+        // Solidity sources.
+        paths.push(config.src.clone());
+
+        // External libraries when explicitly opted in.
+        if include_libraries {
+            for lib in &config.libs {
+                paths.push(lib.clone());
+            }
+        }
+
+        // Homepage source: explicit override, else <root>/README.md when present.
+        if let Some(hp) = &config.doc.homepage {
+            let hp_path = if hp.is_absolute() { hp.clone() } else { root.join(hp) };
+            if hp_path.exists() {
+                paths.push(hp_path);
+            }
+        }
+        // Mirror vocs homepage resolution: <sources>/README.md takes priority over
+        // <root>/README.md.
+        let src_readme = config.src.join("README.md");
+        if src_readme.exists() {
+            paths.push(src_readme);
+        }
+        let readme = root.join("README.md");
+        if readme.exists() {
+            paths.push(readme);
+        }
+
+        // Deployments directory: only when the user enabled `--deployments`.
+        if let Some(dir_opt) = deployments_arg.as_ref() {
+            let dep_dir = match dir_opt {
+                Some(p) if p.is_absolute() => p.clone(),
+                Some(p) => root.join(p),
+                None => root.join("deployments"),
+            };
+            if dep_dir.exists() {
+                paths.push(dep_dir);
+            }
+        }
+
+        // Foundry config file (`foundry.toml`), when present.
+        let toml = root.join("foundry.toml");
+        if toml.exists() {
+            paths.push(toml);
+        }
+
+        Ok(paths)
     })?;
     run(config).await
 }
@@ -401,59 +534,373 @@ pub async fn watch_doc(args: DocArgs) -> Result<()> {
 /// # Panics
 ///
 /// Panics if `args` is empty.
-fn watch_command(mut args: Vec<String>) -> Command {
+fn watch_command(mut args: Vec<OsString>) -> Result<Command> {
     debug_assert!(!args.is_empty());
-    let prog = args.remove(0);
-    Command { program: Program::Exec { prog: prog.into(), args }, options: Default::default() }
+    let prog = PathBuf::from(args.remove(0));
+    let args = args
+        .into_iter()
+        .map(|arg| {
+            arg.into_string().map_err(|arg| {
+                eyre::eyre!(
+                    "watchexec requires UTF-8 command arguments; {arg:?} is not valid UTF-8"
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Command { program: Program::Exec { prog, args }, options: Default::default() })
 }
 
-/// Returns the env args without the `--watch` flag from the args for the Watchexec command
-fn cmd_args(num: usize) -> Vec<String> {
-    clean_cmd_args(num, std::env::args().collect())
+/// Returns the env args without the `--watch` flag from the args for the Watchexec command.
+///
+/// `args_os` is used instead of `args` because the latter panics on an argument that is not valid
+/// Unicode, and a watched path is a `PathBuf`, which is allowed to be non-Unicode on Unix.
+fn cmd_args() -> Vec<OsString> {
+    clean_cmd_args(std::env::args_os().collect())
 }
 
+/// How a command-line argument relates to the `watch` flag.
+enum WatchFlag {
+    /// Not the `watch` flag.
+    Other,
+    /// `--watch`, `-w`, or a short flag cluster ending in `w`, with the paths given as the
+    /// arguments that follow it. Holds the valueless short flags leading up to `w`, which are kept.
+    Bare(Option<OsString>),
+    /// `--watch=<PATH>`, `-w<PATH>`, or a short flag cluster with the path attached to its `w`.
+    /// Holds the valueless short flags leading up to `w`, which are kept.
+    Inline(Option<OsString>),
+}
+
+/// Removes the `--watch` flag from the args for the Watchexec command, so that the child command
+/// does not enter watch mode itself and spawn another watcher.
+///
+/// `watch` is an `Option<Vec<PathBuf>>`, so clap accepts the flag as `--watch <PATH>`,
+/// `--watch=<PATH>`, `-w <PATH>`, and `-w<PATH>`, combines it with other short flags (`-vw`,
+/// `-vw<PATH>`), and allows it to repeat, appending the paths of every occurrence.
 #[instrument(level = "debug", ret)]
-fn clean_cmd_args(num: usize, mut cmd_args: Vec<String>) -> Vec<String> {
-    if let Some(pos) = cmd_args.iter().position(|arg| arg == "--watch" || arg == "-w") {
-        cmd_args.drain(pos..=(pos + num));
+fn clean_cmd_args(cmd_args: Vec<OsString>) -> Vec<OsString> {
+    let mut cleaned = Vec::with_capacity(cmd_args.len());
+    let (value_less_short_flags, variable_options) = command_options(&cmd_args);
+    let mut args = cmd_args.into_iter().peekable();
+    cleaned.extend(args.next());
+    let mut deferred = Vec::new();
+
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            cleaned.append(&mut deferred);
+            cleaned.push(arg);
+            cleaned.extend(args);
+            break;
+        }
+
+        match watch_flag(&arg, &value_less_short_flags) {
+            WatchFlag::Other => {
+                let option = arg.as_encoded_bytes().strip_prefix(b"--").map(|bytes| {
+                    let end = bytes.iter().position(|&byte| byte == b'=').unwrap_or(bytes.len());
+                    (&bytes[..end], end < bytes.len())
+                });
+                if let Some((name, attached)) = option
+                    && let Ok(name) = std::str::from_utf8(name)
+                    && let Some(&max_values) = variable_options.get(name)
+                {
+                    // Keep greedy options and their original values together at the end, so
+                    // removing watch cannot make them consume a previously positional argument.
+                    deferred.push(arg);
+                    if !attached {
+                        for _ in 0..max_values {
+                            if !args.peek().is_some_and(|next| !looks_like_option(next)) {
+                                break;
+                            }
+                            deferred.extend(args.next());
+                        }
+                    }
+                } else {
+                    cleaned.push(arg);
+                }
+            }
+            WatchFlag::Inline(kept) => cleaned.extend(kept),
+            WatchFlag::Bare(kept) => {
+                cleaned.extend(kept);
+                // clap consumes the values of a `num_args(0..)` argument greedily, up to the next
+                // option-like argument, so the paths follow the flag until one of those.
+                while args.peek().is_some_and(|next| !looks_like_option(next)) {
+                    args.next();
+                }
+            }
+        }
     }
 
-    // There's another edge case where short flags are combined into one which is supported by clap,
-    // like `-vw` for verbosity and watch
-    // this removes any `w` from concatenated short flags
-    if let Some(pos) = cmd_args.iter().position(|arg| {
-        fn contains_w_in_short(arg: &str) -> Option<bool> {
-            let mut iter = arg.chars().peekable();
-            if *iter.peek()? != '-' {
-                return None;
+    cleaned.extend(deferred);
+    cleaned
+}
+
+/// Returns how `arg` relates to the `watch` flag.
+fn watch_flag(arg: &OsStr, value_less_short_flags: &HashSet<char>) -> WatchFlag {
+    let bytes = arg.as_encoded_bytes();
+    if bytes == b"--watch" || bytes == b"-w" {
+        return WatchFlag::Bare(None);
+    }
+    if bytes.starts_with(b"--watch=") {
+        return WatchFlag::Inline(None);
+    }
+    let Some(pos) = short_watch_pos(bytes, value_less_short_flags) else {
+        return WatchFlag::Other;
+    };
+    // Everything after `w` is the path attached to it; only the preceding valueless short flags
+    // are kept. The prefix is ASCII because it consists only of recognized option bytes.
+    let kept = (pos > 1).then(|| OsString::from(std::str::from_utf8(&bytes[..pos]).unwrap()));
+    if bytes.len() == pos + 1 { WatchFlag::Bare(kept) } else { WatchFlag::Inline(kept) }
+}
+
+/// Returns the byte index after `w` in a short flag cluster, if `arg` contains a watch flag.
+///
+/// clap parses a short flag cluster from left to right. Only short flags with no value in the
+/// active command may precede `w`; a value-taking flag such as `-D` or `-C` makes the remaining
+/// bytes its value instead.
+fn short_watch_pos(arg: &[u8], value_less_short_flags: &HashSet<char>) -> Option<usize> {
+    let cluster = arg.strip_prefix(b"-")?;
+    if cluster.is_empty() || cluster.starts_with(b"-") {
+        return None;
+    }
+    let pos = cluster.iter().position(|&byte| byte == b'w')?;
+    cluster[..pos]
+        .iter()
+        .all(|&byte| byte.is_ascii() && value_less_short_flags.contains(&(byte as char)))
+        .then_some(pos + 1)
+}
+
+/// Returns whether `arg` looks like an option, which is where clap stops consuming the values of a
+/// `num_args(0..)` argument. A lone `-` is a value.
+fn looks_like_option(arg: &OsStr) -> bool {
+    let bytes = arg.as_encoded_bytes();
+    bytes.len() > 1 && bytes.starts_with(b"-")
+}
+
+/// Returns valueless short flags and variable-arity long options for the active command.
+fn command_options(cmd_args: &[OsString]) -> (HashSet<char>, HashMap<String, usize>) {
+    let mut command = Forge::command();
+    let mut flags = HashSet::default();
+    let mut variable_options = HashMap::default();
+    if let Ok(matches) = command.try_get_matches_from_mut(cmd_args)
+        && let Some((name, _)) = matches.subcommand()
+        && let Some(command) = command.find_subcommand(name)
+    {
+        // Parsing builds the selected subcommand, including inherited global arguments.
+        for arg in command.get_arguments() {
+            let range = arg.get_num_args().unwrap_or_default();
+            if range.max_values() == 0 {
+                flags.extend(arg.get_short());
+                flags.extend(arg.get_all_short_aliases().unwrap_or_default());
+            } else if arg.get_id() != "watch"
+                && range.min_values() != range.max_values()
+                && let Some(long) = arg.get_long()
+            {
+                variable_options.insert(long.to_owned(), range.max_values());
+                for alias in arg.get_all_aliases().unwrap_or_default() {
+                    variable_options.insert(alias.to_owned(), range.max_values());
+                }
             }
-            iter.next();
-            if *iter.peek()? == '-' {
-                return None;
-            }
-            Some(iter.any(|c| c == 'w'))
-        }
-        contains_w_in_short(arg).unwrap_or(false)
-    }) {
-        let clean_arg = cmd_args[pos].replace('w', "");
-        if clean_arg == "-" {
-            cmd_args.remove(pos);
-        } else {
-            cmd_args[pos] = clean_arg;
         }
     }
-
-    cmd_args
+    (flags, variable_options)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use watchexec_events::Modifiers;
+
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
+
+    fn key_event(key: char, modifiers: Modifiers) -> Event {
+        Event {
+            tags: vec![Tag::Keyboard(Keyboard::Key { key: KeyCode::Char(key), modifiers })],
+            ..Default::default()
+        }
+    }
+
+    fn clean(args: &[&str]) -> Vec<OsString> {
+        clean_cmd_args(args.iter().copied().map(OsString::from).collect())
+    }
 
     #[test]
-    fn parse_cmd_args() {
-        let args = vec!["-vw".to_string()];
-        let cleaned = clean_cmd_args(0, args);
-        assert_eq!(cleaned, vec!["-v".to_string()]);
+    fn classifies_keyboard_actions() {
+        assert_eq!(
+            keyboard_action(&[key_event('a', Modifiers::default())]),
+            Some(KeyboardAction::Rerun)
+        );
+        assert_eq!(keyboard_action(&[key_event('x', Modifiers::default())]), None);
+        assert_eq!(
+            keyboard_action(&[key_event('a', Modifiers { ctrl: true, ..Default::default() })]),
+            None
+        );
+
+        let eof = Event { tags: vec![Tag::Keyboard(Keyboard::Eof)], ..Default::default() };
+        assert_eq!(
+            keyboard_action(&[key_event('a', Modifiers::default()), eof]),
+            Some(KeyboardAction::Quit)
+        );
+    }
+
+    #[test]
+    fn locked_survives_cleaning_watch_args() {
+        assert_eq!(
+            clean(&["forge", "build", "--locked", "--watch", "src", "test"]),
+            ["forge", "build", "--locked"]
+        );
+
+        assert_eq!(
+            clean(&["forge", "build", "--watch", "src", "--locked"]),
+            ["forge", "build", "--locked"]
+        );
+    }
+
+    #[test]
+    fn watch_spellings_survive_cleaning_watch_args() {
+        assert_eq!(clean(&["forge", "build", "-vw"]), ["forge", "build", "-v"]);
+        assert_eq!(clean(&["forge", "test", "--watch", "src"]), ["forge", "test"]);
+        assert_eq!(clean(&["forge", "test", "--watch=src"]), ["forge", "test"]);
+        assert_eq!(clean(&["forge", "test", "-w", "src"]), ["forge", "test"]);
+        assert_eq!(clean(&["forge", "test", "-wsrc"]), ["forge", "test"]);
+        assert_eq!(clean(&["forge", "test", "-vw", "src"]), ["forge", "test", "-v"]);
+        assert_eq!(clean(&["forge", "test", "-vwsrc"]), ["forge", "test", "-v"]);
+    }
+
+    #[test]
+    fn repeated_watch_survives_cleaning_watch_args() {
+        assert_eq!(
+            clean(&["forge", "test", "--watch", "src", "--watch", "test"]),
+            ["forge", "test"]
+        );
+
+        assert_eq!(clean(&["forge", "test", "--watch=src", "-w"]), ["forge", "test"]);
+        assert_eq!(clean(&["forge", "test", "-w", "--watch=src"]), ["forge", "test"]);
+    }
+
+    #[test]
+    fn other_flags_survive_cleaning_watch_args() {
+        // `--watch-delay` is a different flag.
+        assert_eq!(
+            clean(&["forge", "test", "--watch-delay", "1s"]),
+            ["forge", "test", "--watch-delay", "1s"]
+        );
+
+        // A `w` in the value attached to another short flag is not the watch flag.
+        assert_eq!(clean(&["forge", "test", "-C./workspace"]), ["forge", "test", "-C./workspace"]);
+
+        assert_eq!(clean(&["forge", "build", "-Dwarnings"]), ["forge", "build", "-Dwarnings"]);
+    }
+
+    #[test]
+    fn command_specific_short_flags_survive_cleaning_watch_args() {
+        assert_eq!(clean(&["forge", "build", "-qw", "src"]), ["forge", "build", "-q"]);
+        assert_eq!(clean(&["forge", "fmt", "-rw", "src"]), ["forge", "fmt", "-r"]);
+        assert_eq!(clean(&["forge", "b", "-vw"]), ["forge", "b", "-v"]);
+    }
+
+    #[test]
+    fn watch_cleanup_stops_after_double_dash() {
+        assert_eq!(
+            clean(&["forge", "fmt", "--watch", "src", "--", "--watch=keep.sol"]),
+            ["forge", "fmt", "--", "--watch=keep.sol"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_watch_survives_cleaning_watch_args() {
+        let mut args = ["forge", "test", "--watch"].map(OsString::from).to_vec();
+        args.push(OsStr::from_bytes(b"src/\xff").to_os_string());
+
+        assert_eq!(clean_cmd_args(args), ["forge", "test"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_watch_suffixes_and_options_are_preserved() {
+        for path in [b"--watch=src/\xff".as_slice(), b"-wsrc/\xff".as_slice()] {
+            let args = ["forge", "fmt"]
+                .map(OsString::from)
+                .into_iter()
+                .chain([OsStr::from_bytes(path).to_os_string()])
+                .collect();
+            assert_eq!(clean_cmd_args(args), ["forge", "fmt"]);
+        }
+
+        let args = ["forge", "build", "-w", "src"]
+            .map(OsString::from)
+            .into_iter()
+            .chain([OsStr::from_bytes(b"--out=out/\xff").to_os_string()])
+            .collect();
+        assert_eq!(
+            clean_cmd_args(args),
+            vec![
+                OsString::from("forge"),
+                OsString::from("build"),
+                OsStr::from_bytes(b"--out=out/\xff").to_os_string(),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_program_path_is_preserved() {
+        let args = vec![OsStr::from_bytes(b"forge\xff").to_os_string(), OsString::from("build")];
+        let command = watch_command(args).unwrap();
+        let Program::Exec { prog, args } = command.program else { panic!("expected exec program") };
+        assert_eq!(prog, PathBuf::from(OsStr::from_bytes(b"forge\xff")));
+        assert_eq!(args, ["build"]);
+    }
+
+    #[test]
+    fn watch_cleanup_preserves_argument_values() {
+        for args in [
+            vec!["forge", "build", "--optimize", "--watch=src", "src/Counter.sol", "--sizes"],
+            vec!["forge", "snapshot", "--check", "--watch=src", "test/Counter.t.sol"],
+            vec!["forge", "snapshot", "--optimize", "--check", "-wsrc", "test/Counter.t.sol"],
+            vec![
+                "forge",
+                "snapshot",
+                "--check",
+                "--watch=src",
+                "test/Counter.t.sol",
+                "--snap",
+                "custom",
+            ],
+            vec!["forge", "build", "--skip", "test", "script", "--watch=src", "src/Counter.sol"],
+            vec![
+                "forge",
+                "build",
+                "--skip",
+                "test",
+                "--watch=src",
+                "src/Counter.sol",
+                "--skip=script",
+            ],
+            vec!["forge", "build", "--optimize", "--watch=src", "--", "src/Counter.sol"],
+        ] {
+            let mut command = Forge::command();
+            let parent = command.try_get_matches_from_mut(&args).unwrap();
+            let child = Forge::command().try_get_matches_from(clean(&args)).unwrap();
+            let (name, parent) = parent.subcommand().unwrap();
+            let (_, child) = child.subcommand().unwrap();
+            assert!(child.get_raw("watch").is_none(), "{args:?}");
+            for arg in command.find_subcommand(name).unwrap().get_arguments() {
+                let id = arg.get_id();
+                if id == "watch" {
+                    continue;
+                }
+                assert_eq!(
+                    parent.get_raw(id.as_str()).map(|values| values.collect::<Vec<_>>()),
+                    child.get_raw(id.as_str()).map(|values| values.collect::<Vec<_>>()),
+                    "{args:?}: {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn watch_cleanup_preserves_program_name() {
+        assert_eq!(clean(&["--watch=forge", "fmt", "--watch", "src"]), ["--watch=forge", "fmt"]);
     }
 }
